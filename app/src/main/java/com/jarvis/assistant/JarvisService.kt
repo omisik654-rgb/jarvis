@@ -8,6 +8,7 @@ import android.app.SearchManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.camera2.CameraCharacteristics
@@ -33,6 +34,7 @@ import android.view.KeyEvent
 import org.json.JSONObject
 import org.vosk.Model
 import org.vosk.Recognizer
+import org.vosk.SpeakerModel
 import org.vosk.android.RecognitionListener
 import org.vosk.android.SpeechService
 import java.io.File
@@ -48,6 +50,7 @@ class JarvisService : Service() {
 
     private var enModel: Model? = null
     private var trModel: Model? = null
+    private var spkModel: SpeakerModel? = null
     private var wakeSpeech: SpeechService? = null
     private var cmdSpeech: SpeechService? = null
     private var tts: TextToSpeech? = null
@@ -60,6 +63,27 @@ class JarvisService : Service() {
     private var followUp: ((String) -> String)? = null
     private var savedVolume = -1
     private var wakeLock: PowerManager.WakeLock? = null
+    private var friendMode = false
+    private var enrolling = false
+    private val enrollVecs = mutableListOf<DoubleArray>()
+    private var lastSpk: DoubleArray? = null
+    private var lastFrames = 0
+
+    private val aiMark = "@@AI@@"
+
+    private val sysAssistant =
+        "Sen Jarvis'sin, kullanıcının telefondaki sesli asistanısın. Kısa, net, doğal Türkçe konuş. " +
+            "Cevapların sesli okunacak, bu yüzden madde işareti, markdown ve emoji kullanma. " +
+            "Normalde en fazla 3-4 cümle yaz. Kullanıcı makale, rapor, plan, program gibi uzun bir şey isterse uzun yaz. " +
+            "Sağlık sorularında genel bilgi ver, teşhis koyma, ciddi belirtilerde doktora veya 112'ye yönlendir. " +
+            "Spor ve borsa konularında olasılıklarla konuş, kesin sonuç veya garanti verme, yatırım tavsiyesi verme. " +
+            "Bilmediğin şeyi uydurma."
+
+    private val sysFriend =
+        "Sen Jarvis'sin ve kullanıcının sohbet arkadaşısın. Sıcak, samimi, dinleyen biri gibi 1-3 cümleyle konuş, arada soru sor. " +
+            "Cevapların sesli okunacak, markdown ve emoji kullanma. " +
+            "Kullanıcı kendine zarar vermekten veya yaşamak istemediğinden söz ederse sakin ve şefkatli ol, yalnız olmadığını söyle " +
+            "ve 112'yi ya da güvendiği birini aramasını öner. Sağlık konusunda teşhis koyma."
 
     private val finalizeRunnable = Runnable { gotText(buffer) }
 
@@ -86,10 +110,19 @@ class JarvisService : Service() {
         "rota", "hoparlor", "sessiz", "whatsapp", "youtube", "kamera", "ayarlar"
     )
 
+    private val localKeys = listOf(
+        "alarm", "sayac", "zamanlayici", "geri sayim", "mesaj", "sms", "hoparlor", "rota",
+        "yol tarifi", "navigasyon", "muzi", "sarki", "fener", "sessiz", "titresim", "zil",
+        "saat", "pil", "sarj", "tarih", "merhaba", "selam"
+    )
+
+    private fun prefs(): SharedPreferences = getSharedPreferences("jarvis", Context.MODE_PRIVATE)
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         showNotification("Hazırlanıyor...")
+        val wantFriend = intent?.getBooleanExtra("friend", false) == true
         if (wakeLock == null) {
             try {
                 val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -99,6 +132,13 @@ class JarvisService : Service() {
             }
         }
         if (tts == null) initTts()
+        if (wantFriend) {
+            if (enModel != null && trModel != null) {
+                handler.post { enterFriend() }
+            } else {
+                friendMode = true
+            }
+        }
         if (enModel == null && !loading) {
             loading = true
             Thread {
@@ -107,7 +147,12 @@ class JarvisService : Service() {
                     val tr = Model(prepare("model-tr").absolutePath)
                     enModel = en
                     trModel = tr
-                    handler.post { startWake() }
+                    try {
+                        spkModel = SpeakerModel(prepare("model-spk").absolutePath)
+                    } catch (e: Throwable) {
+                        spkModel = null
+                    }
+                    handler.post { if (friendMode) enterFriend() else startWake() }
                 } catch (e: Throwable) {
                     showNotification("Hata: ${e.message}")
                 } finally {
@@ -137,7 +182,17 @@ class JarvisService : Service() {
     }
 
     private fun spoken(id: String?) {
-        if (id == "wake" || followUp != null) startCommand() else resumeWake()
+        if (id == "wake" || id == "friend" || followUp != null || friendMode) startCommand() else resumeWake()
+    }
+
+    private fun enterFriend() {
+        friendMode = true
+        followUp = null
+        Ai.clear()
+        busy = true
+        stopCmd()
+        stopWake()
+        say("Merhaba, seni dinliyorum. Nasılsın?", "friend")
     }
 
     private val wakeListener = object : RecognitionListener {
@@ -162,6 +217,7 @@ class JarvisService : Service() {
                 buffer = (buffer + " " + t).trim()
                 handler.removeCallbacks(finalizeRunnable)
                 handler.postDelayed(finalizeRunnable, 2500)
+                readSpeaker(h)
             }
         }
         override fun onFinalResult(h: String?) {}
@@ -172,11 +228,31 @@ class JarvisService : Service() {
             if (txt.isBlank()) {
                 if (!handled) {
                     handled = true
-                    resumeWake()
+                    if (friendMode) {
+                        friendMode = false
+                        Ai.clear()
+                        stopCmd()
+                        say("Görüşürüz, ihtiyacın olursa Jarvis de", "reply")
+                    } else {
+                        resumeWake()
+                    }
                 }
             } else {
                 gotText(txt)
             }
+        }
+    }
+
+    private fun readSpeaker(h: String?) {
+        try {
+            val o = JSONObject(h ?: "")
+            val arr = o.optJSONArray("spk") ?: return
+            val fr = o.optInt("spk_frames", 0)
+            if (fr >= lastFrames) {
+                lastSpk = DoubleArray(arr.length()) { arr.getDouble(it) }
+                lastFrames = fr
+            }
+        } catch (e: Throwable) {
         }
     }
 
@@ -224,12 +300,16 @@ class JarvisService : Service() {
         handled = false
         lastPartial = ""
         buffer = ""
+        lastSpk = null
+        lastFrames = 0
         handler.removeCallbacks(finalizeRunnable)
         try {
             val rec = Recognizer(trModel!!, 16000.0f)
+            val sm = spkModel
+            if (sm != null) rec.setSpeakerModel(sm)
             cmdSpeech = SpeechService(rec, 16000.0f)
             cmdSpeech?.startListening(cmdListener, 20000)
-            showNotification("Dinliyorum, komutu söyle...")
+            showNotification(if (friendMode) "Seni dinliyorum..." else "Dinliyorum, komutu söyle...")
         } catch (e: Throwable) {
             showNotification("Hata: ${e.message}")
             resumeWake()
@@ -246,13 +326,70 @@ class JarvisService : Service() {
         cmdSpeech = null
     }
 
+    private fun cosDist(a: DoubleArray, b: DoubleArray): Double {
+        if (a.size != b.size || a.isEmpty()) return 1.0
+        var dot = 0.0
+        var na = 0.0
+        var nb = 0.0
+        for (i in a.indices) {
+            dot += a[i] * b[i]
+            na += a[i] * a[i]
+            nb += b[i] * b[i]
+        }
+        if (na == 0.0 || nb == 0.0) return 1.0
+        return 1.0 - dot / (Math.sqrt(na) * Math.sqrt(nb))
+    }
+
+    private fun loadRef(): DoubleArray? {
+        val s = prefs().getString("spk_ref", null) ?: return null
+        return try {
+            s.split(",").map { it.toDouble() }.toDoubleArray()
+        } catch (e: Throwable) {
+            null
+        }
+    }
+
+    private fun speakerDistance(): Double {
+        val ref = loadRef() ?: return -1.0
+        val v = lastSpk ?: return -1.0
+        if (lastFrames < 150) return -1.0
+        return cosDist(ref, v)
+    }
+
+    private fun speakerAllowed(d: Double): Boolean {
+        if (d < 0) return true
+        if (!prefs().getBoolean("spk_on", true)) return true
+        return d <= prefs().getFloat("spk_thr", 0.6f)
+    }
+
     private fun gotText(text: String) {
         if (handled) return
         if (text.isBlank()) return
         handled = true
         stopCmd()
-        showNotification("Duyduğum: $text")
         val low = text.lowercase(trLocale)
+        val dist = speakerDistance()
+        val distText = if (dist >= 0) " (ses mesafesi " + String.format(Locale.US, "%.2f", dist) + ")" else ""
+        showNotification("Duyduğum: $text$distText")
+        if (!enrolling && !speakerAllowed(dist)) {
+            followUp = null
+            say("Sesinizi tanıyamadım", "reply")
+            return
+        }
+        if (friendMode) {
+            val x = norm(low)
+            if (x.contains("gorusuruz") || x.contains("hosca kal") || x.contains("konusmayi bitir") ||
+                x.contains("tamam bu kadar") || x.contains("sohbeti bitir")
+            ) {
+                friendMode = false
+                followUp = null
+                Ai.clear()
+                say("Görüşürüz, kendine iyi bak", "reply")
+                return
+            }
+            askAi(low, true)
+            return
+        }
         val f = followUp
         followUp = null
         val reply = try {
@@ -260,15 +397,76 @@ class JarvisService : Service() {
         } catch (e: Throwable) {
             "Bir hata oldu"
         }
+        if (reply == aiMark) return
         say(reply, "reply")
     }
 
     private fun resumeWake() {
         followUp = null
+        enrolling = false
+        enrollVecs.clear()
         stopCmd()
         stopWake()
         unduck()
         startWake()
+    }
+
+    private fun hasKey(): Boolean {
+        return (prefs().getString("api_key", "") ?: "").isNotBlank()
+    }
+
+    private fun needsSearch(nt: String): Boolean {
+        val keys = listOf(
+            "arastir", "haber", "guncel", "mac", "borsa", "dolar", "euro", "altin",
+            "son dakika", "fiyat", "skor", "kimdir", "puan durumu", "hava durumu"
+        )
+        return keys.any { nt.contains(it) }
+    }
+
+    private fun isLong(nt: String): Boolean {
+        val keys = listOf("makale", "rapor", "ders programi", "calisma programi", "plan", "analiz", "yaz", "ozet", "hikaye")
+        return keys.any { nt.contains(it) }
+    }
+
+    private fun askAi(text: String, friend: Boolean) {
+        val key = prefs().getString("api_key", "") ?: ""
+        if (key.isBlank()) {
+            say("Yapay zeka için anahtar girilmemiş. Uygulamadan anahtarı gir", "reply")
+            return
+        }
+        val nt = norm(text)
+        val date = SimpleDateFormat("d MMMM yyyy EEEE HH:mm", trLocale).format(Date())
+        val sys = (if (friend) sysFriend else sysAssistant) + " Bugünün tarihi ve saati: " + date + "."
+        val search = !friend && needsSearch(nt)
+        val max = if (!friend && isLong(nt)) 1500 else 400
+        showNotification("Düşünüyorum...")
+        Thread {
+            val ans = try {
+                Ai.ask(key, text, sys, search, max)
+            } catch (e: ApiError) {
+                if (e.code == 401) {
+                    "Yapay zeka anahtarı geçersiz görünüyor. Uygulamadan anahtarı kontrol et"
+                } else {
+                    "Yapay zeka hatası. " + (e.message ?: "")
+                }
+            } catch (e: Throwable) {
+                "Yapay zekaya ulaşamadım. İnternet bağlantısını kontrol edin"
+            }
+            handler.post { deliver(ans) }
+        }.start()
+    }
+
+    private fun deliver(ans: String) {
+        prefs().edit().putString("last_answer", ans).apply()
+        var s = ans.replace(Regex("[*#_`>]"), "").replace(Regex("\\s+"), " ").trim()
+        if (s.isBlank()) s = "Cevap alamadım"
+        if (s.length > 600) {
+            val cut = s.lastIndexOf('.', 600)
+            s = s.substring(0, if (cut > 200) cut + 1 else 600) +
+                " Devamını uygulamadaki son cevap bölümünde okuyabilirsiniz."
+        }
+        showNotification("Cevap hazır")
+        say(s, "reply")
     }
 
     private fun audio(): AudioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -345,12 +543,21 @@ class JarvisService : Service() {
             .filter { it.isNotBlank() }
     }
 
+    private fun isLocal(p: String): Boolean {
+        val words = p.split(" ").filter { it.isNotBlank() }
+        val tokens = setOf("ara", "arar", "arayin", "arasana", "ac", "baslat", "calistir", "ses", "sesi", "cal", "oynat")
+        if (words.any { it in tokens }) return true
+        return localKeys.any { p.contains(it) }
+    }
+
     private fun runAll(low: String): String {
         val parts = splitCommands(norm(low))
-        if (parts.size <= 1) return execute(low)
+        if (parts.size <= 1 || !parts.all { isLocal(it) }) return execute(low)
         val replies = mutableListOf<String>()
         for (p in parts) {
-            replies.add(execute(p))
+            val r = execute(p)
+            if (r == aiMark) return aiMark
+            replies.add(r)
             if (followUp != null) break
         }
         return replies.joinToString(". ")
@@ -366,13 +573,31 @@ class JarvisService : Service() {
         val hasVol = words.any { it == "ses" || it == "sesi" }
         val isMusic = nt.contains("muzi") || nt.contains("sarki") || words.any { it == "cal" || it == "oynat" }
         return when {
+            nt.contains("sesimi") && (nt.contains("kaydet") || nt.contains("tani") || nt.contains("ogren")) -> startEnroll()
+            nt.contains("ses kaydini sil") || nt.contains("sesimi unut") -> {
+                prefs().edit().remove("spk_ref").apply()
+                "Ses kaydı silindi"
+            }
+            nt.contains("ses kilid") || nt.contains("ses tanima") -> {
+                val on = !nt.contains("kapat")
+                prefs().edit().putBoolean("spk_on", on).apply()
+                if (on) "Ses kilidi açıldı" else "Ses kilidi kapatıldı"
+            }
+            nt.contains("hassasiyet") -> {
+                var t = prefs().getFloat("spk_thr", 0.6f)
+                if (nt.contains("artir") || nt.contains("yukselt")) t -= 0.05f
+                if (nt.contains("azalt") || nt.contains("dusur")) t += 0.05f
+                t = t.coerceIn(0.2f, 0.9f)
+                prefs().edit().putFloat("spk_thr", t).apply()
+                "Ses hassasiyeti ayarlandı, eşik " + String.format(Locale.US, "%.2f", t)
+            }
             nt.contains("alarm") -> setAlarm(nt, words)
             nt.contains("sayac") || nt.contains("zamanlayici") || nt.contains("geri sayim") -> setTimer(nt, words)
             words.any { it in callWords } -> callName(words)
             words.any { it == "mesaj" || it == "sms" } -> prepareSms(words, raw)
             nt.contains("hoparlor") -> speaker(!nt.contains("kapat"))
             nt.contains("rota") || nt.contains("yol tarifi") || nt.contains("navigasyon") ||
-                words.any { it == "gotur" || it == "goturr" } -> routeCmd(words)
+                words.any { it == "gotur" } -> routeCmd(words)
             isMusic -> musicRouter(nt, words, raw)
             nt.contains("fener") -> setTorch(!(nt.contains("kapat") || nt.contains("sondur")))
             nt.contains("sessiz") || nt.contains("titresim") ->
@@ -382,11 +607,11 @@ class JarvisService : Service() {
             hasVol && volumeFromSpeech(nt, words) != null -> volumeFromSpeech(nt, words) ?: "Ses ayarlandı"
             hasVol && (nt.contains("artir") || nt.contains("yuksel") || isOpen) -> volume(true)
             hasVol && (nt.contains("azalt") || nt.contains("kis") || nt.contains("dusur")) -> volume(false)
-            nt.contains("saat") && !isOpen -> {
+            nt.contains("saat") && !isOpen && !nt.contains("saatte") -> {
                 val c = Calendar.getInstance()
                 "Saat " + String.format("%02d:%02d", c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE))
             }
-            nt.contains("tarih") || nt.contains("bugun") ->
+            nt.contains("tarih") || nt.contains("ayin kaci") || nt.contains("hangi gun") ->
                 SimpleDateFormat("d MMMM EEEE", trLocale).format(Date())
             nt.contains("pil") || nt.contains("sarj") -> {
                 val bm = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
@@ -403,11 +628,55 @@ class JarvisService : Service() {
                 }
             }
             nt.contains("merhaba") || nt.contains("selam") -> "Merhaba, size nasıl yardımcı olabilirim"
-            else -> suggest(nt, words)
+            else -> {
+                if (hasKey()) {
+                    askAi(low, false)
+                    aiMark
+                } else {
+                    suggest(nt, words) ?: ("Tam anlayamadım. Şunu duydum: " + nt)
+                }
+            }
         }
     }
 
-    private fun suggest(nt: String, words: List<String>): String {
+    private fun startEnroll(): String {
+        if (spkModel == null) return "Ses tanıma modeli yüklenemedi"
+        enrolling = true
+        enrollVecs.clear()
+        followUp = { a -> enrollStep(a) }
+        return "Sesinizi tanımam için üç uzun cümle söyleyin. Birinci cümle. " +
+            "Bugün hava çok güzel ve ben telefonumu sadece sesimle kontrol etmek istiyorum"
+    }
+
+    private fun enrollStep(a: String): String {
+        val v = lastSpk
+        if (v == null || lastFrames < 250) {
+            followUp = { x -> enrollStep(x) }
+            return "Sesiniz yeterince uzun alınamadı. Biraz daha uzun bir cümle söyleyin"
+        }
+        enrollVecs.add(v)
+        if (enrollVecs.size < 3) {
+            followUp = { x -> enrollStep(x) }
+            return if (enrollVecs.size == 1) {
+                "İkinci cümle. Bu akşam ne yapacağımı henüz bilmiyorum ama yarın erken kalkmam gerekiyor"
+            } else {
+                "Son cümle. Müzik dinlemeyi, yeni yerler keşfetmeyi ve arkadaşlarımla vakit geçirmeyi çok severim"
+            }
+        }
+        val n = v.size
+        val avg = DoubleArray(n)
+        for (e in enrollVecs) {
+            if (e.size == n) {
+                for (i in 0 until n) avg[i] += e[i] / enrollVecs.size
+            }
+        }
+        prefs().edit().putString("spk_ref", avg.joinToString(",")).putBoolean("spk_on", true).apply()
+        enrolling = false
+        enrollVecs.clear()
+        return "Sesiniz kaydedildi. Artık komutları sadece sizden kabul edeceğim"
+    }
+
+    private fun suggest(nt: String, words: List<String>): String? {
         for (w in words) {
             if (w.length < 3) continue
             for (k in keywords) {
@@ -419,7 +688,7 @@ class JarvisService : Service() {
                 }
             }
         }
-        return "Tam anlayamadım. Şunu duydum: $nt"
+        return null
     }
 
     private fun launch(i: Intent) {
@@ -646,7 +915,7 @@ class JarvisService : Service() {
 
     private fun routeCmd(words: List<String>): String {
         val stop = setOf(
-            "rota", "olustur", "cizer", "cizin", "yol", "tarifi", "git", "gotur", "goturr",
+            "rota", "olustur", "cizer", "cizin", "yol", "tarifi", "git", "gotur",
             "navigasyon", "icin", "bana", "bir", "cikar", "ac", "baslat", "lutfen", "bul", "hemen"
         )
         val dest = words.filter { it !in stop }.joinToString(" ")
@@ -873,6 +1142,7 @@ class JarvisService : Service() {
         try {
             enModel?.close()
             trModel?.close()
+            spkModel?.close()
         } catch (e: Throwable) {
         }
         try {
