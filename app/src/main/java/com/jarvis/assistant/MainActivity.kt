@@ -31,8 +31,23 @@ class MainActivity : Activity() {
             )
         }
 
+        val battery = Button(this)
+        battery.text = "3) Pil kisitlamasini kaldir"
+        battery.setOnClickListener {
+            try {
+                startActivity(
+                    Intent(
+                        Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                        Uri.parse("package:" + packageName)
+                    )
+                )
+            } catch (e: Throwable) {
+                startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS))
+            }
+        }
+
         val start = Button(this)
-        start.text = "3) Jarvis'i Baslat"
+        start.text = "4) Jarvis'i Baslat"
         start.setOnClickListener {
             if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
                 startForegroundService(Intent(this, JarvisService::class.java))
@@ -47,6 +62,7 @@ class MainActivity : Activity() {
 
         root.addView(perm)
         root.addView(overlay)
+        root.addView(battery)
         root.addView(start)
         root.addView(stop)
         setContentView(root)
