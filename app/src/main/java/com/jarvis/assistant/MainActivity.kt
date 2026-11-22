@@ -8,16 +8,25 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.Settings
+import android.text.InputType
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import android.widget.Toast
 
 class MainActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        val prefs = getSharedPreferences("jarvis", MODE_PRIVATE)
+
+        val scroll = ScrollView(this)
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
         root.setPadding(48, 96, 48, 48)
+        scroll.addView(root)
 
         val perm = Button(this)
         perm.text = "1) Izinleri ver"
@@ -46,11 +55,37 @@ class MainActivity : Activity() {
             }
         }
 
+        val keyField = EditText(this)
+        val saved = (prefs.getString("api_key", "") ?: "").isNotBlank()
+        keyField.hint = if (saved) "Anahtar kayitli (degistirmek icin yenisini yaz)" else "Yapay zeka API anahtari"
+        keyField.inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+
+        val saveKey = Button(this)
+        saveKey.text = "4) Anahtari kaydet"
+        saveKey.setOnClickListener {
+            val k = keyField.text.toString().trim()
+            if (k.isNotEmpty()) {
+                prefs.edit().putString("api_key", k).apply()
+                keyField.setText("")
+                Toast.makeText(this, "Kaydedildi", Toast.LENGTH_SHORT).show()
+            }
+        }
+
         val start = Button(this)
-        start.text = "4) Jarvis'i Baslat"
+        start.text = "5) Jarvis'i Baslat"
         start.setOnClickListener {
-            if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+            if (hasMic()) {
                 startForegroundService(Intent(this, JarvisService::class.java))
+            } else {
+                askPermissions()
+            }
+        }
+
+        val friend = Button(this)
+        friend.text = "Arkadas modu (sohbet)"
+        friend.setOnClickListener {
+            if (hasMic()) {
+                startForegroundService(Intent(this, JarvisService::class.java).putExtra("friend", true))
             } else {
                 askPermissions()
             }
@@ -60,12 +95,39 @@ class MainActivity : Activity() {
         stop.text = "Durdur"
         stop.setOnClickListener { stopService(Intent(this, JarvisService::class.java)) }
 
+        val info = TextView(this)
+        info.setTextIsSelectable(true)
+        info.setPadding(0, 32, 0, 32)
+
+        val last = Button(this)
+        last.text = "Son cevabi goster"
+        last.setOnClickListener {
+            info.text = prefs.getString("last_answer", "Henuz cevap yok")
+        }
+
+        val delVoice = Button(this)
+        delVoice.text = "Ses kaydimi sil"
+        delVoice.setOnClickListener {
+            prefs.edit().remove("spk_ref").apply()
+            Toast.makeText(this, "Ses kaydi silindi", Toast.LENGTH_SHORT).show()
+        }
+
         root.addView(perm)
         root.addView(overlay)
         root.addView(battery)
+        root.addView(keyField)
+        root.addView(saveKey)
         root.addView(start)
+        root.addView(friend)
         root.addView(stop)
-        setContentView(root)
+        root.addView(last)
+        root.addView(delVoice)
+        root.addView(info)
+        setContentView(scroll)
+    }
+
+    private fun hasMic(): Boolean {
+        return checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
     }
 
     private fun askPermissions() {
