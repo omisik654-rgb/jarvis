@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.SearchManager
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -11,6 +12,8 @@ import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
 import android.media.AudioManager
 import android.net.Uri
 import android.os.BatteryManager
@@ -18,8 +21,11 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
+import android.os.SystemClock
 import android.provider.AlarmClock
 import android.provider.ContactsContract
+import android.provider.MediaStore
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.telephony.SmsManager
@@ -52,6 +58,8 @@ class JarvisService : Service() {
     private var lastPartial = ""
     private var buffer = ""
     private var followUp: ((String) -> String)? = null
+    private var savedVolume = -1
+    private var wakeLock: PowerManager.WakeLock? = null
 
     private val finalizeRunnable = Runnable { gotText(buffer) }
 
@@ -59,25 +67,37 @@ class JarvisService : Service() {
         "sifir" to 0, "bir" to 1, "iki" to 2, "uc" to 3, "dort" to 4, "bes" to 5,
         "alti" to 6, "yedi" to 7, "sekiz" to 8, "dokuz" to 9, "on" to 10,
         "yirmi" to 20, "otuz" to 30, "kirk" to 40, "elli" to 50,
-        "altmis" to 60, "yetmis" to 70, "seksen" to 80, "doksan" to 90
+        "altmis" to 60, "yetmis" to 70, "seksen" to 80, "doksan" to 90, "yuz" to 100
     )
     private val sfx = listOf("", "da", "de", "ta", "te", "a", "e", "ya", "ye")
 
-    private val aliases = linkedMapOf(
-        "votsap" to "whatsapp", "vatsap" to "whatsapp", "whatsapp" to "whatsapp",
-        "yutub" to "youtube", "youtube" to "youtube",
-        "instagram" to "instagram", "telegram" to "telegram", "spotify" to "spotify",
-        "rehber" to "kisiler", "kisiler" to "kisiler",
-        "harita" to "harita", "kamera" to "kamera", "galeri" to "galeri",
-        "ayar" to "ayarlar", "telefon" to "telefon", "takvim" to "takvim",
-        "chrome" to "chrome", "krom" to "chrome", "tarayici" to "chrome",
-        "hesap" to "hesap"
+    private val appAliases = mapOf(
+        "votsap" to "whatsapp", "vatsap" to "whatsapp", "vatsapp" to "whatsapp",
+        "whatsap" to "whatsapp", "yutub" to "youtube", "yutup" to "youtube",
+        "insta" to "instagram", "feysbuk" to "facebook", "fesbuk" to "facebook",
+        "cimeyl" to "gmail", "jimeyl" to "gmail", "krom" to "chrome",
+        "tarayici" to "chrome", "internet" to "chrome", "harita" to "haritalar",
+        "rehber" to "kisiler", "ayar" to "ayarlar", "hesap" to "hesapmakinesi",
+        "makine" to "hesapmakinesi", "fotograf" to "galeri"
+    )
+
+    private val keywords = listOf(
+        "alarm", "sayac", "fener", "muzik", "saat", "tarih", "sarj", "mesaj",
+        "rota", "hoparlor", "sessiz", "whatsapp", "youtube", "kamera", "ayarlar"
     )
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         showNotification("Hazırlanıyor...")
+        if (wakeLock == null) {
+            try {
+                val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+                wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "jarvis:wake")
+                wakeLock?.acquire()
+            } catch (e: Throwable) {
+            }
+        }
         if (tts == null) initTts()
         if (enModel == null && !loading) {
             loading = true
@@ -121,8 +141,8 @@ class JarvisService : Service() {
     }
 
     private val wakeListener = object : RecognitionListener {
-        override fun onPartialResult(h: String?) { checkWake(h) }
-        override fun onResult(h: String?) { checkWake(h) }
+        override fun onPartialResult(h: String?) { checkWake(h, true) }
+        override fun onResult(h: String?) { checkWake(h, false) }
         override fun onFinalResult(h: String?) {}
         override fun onError(e: Exception?) { showNotification("Hata: ${e?.message}") }
         override fun onTimeout() {}
@@ -141,7 +161,7 @@ class JarvisService : Service() {
             if (t.isNotBlank()) {
                 buffer = (buffer + " " + t).trim()
                 handler.removeCallbacks(finalizeRunnable)
-                handler.postDelayed(finalizeRunnable, 1200)
+                handler.postDelayed(finalizeRunnable, 2500)
             }
         }
         override fun onFinalResult(h: String?) {}
@@ -162,7 +182,9 @@ class JarvisService : Service() {
 
     private fun startWake() {
         try {
-            val rec = Recognizer(enModel!!, 16000.0f, "[\"jarvis\", \"[unk]\"]")
+            val grammar = "[\"jarvis\", \"travis\", \"service\", \"jarvas\", \"davis\", " +
+                "\"the\", \"you\", \"me\", \"my\", \"is\", \"it\", \"oh\", \"no\", \"go\", \"[unk]\"]"
+            val rec = Recognizer(enModel!!, 16000.0f, grammar)
             wakeSpeech = SpeechService(rec, 16000.0f)
             wakeSpeech?.startListening(wakeListener)
             busy = false
@@ -181,13 +203,21 @@ class JarvisService : Service() {
         wakeSpeech = null
     }
 
-    private fun checkWake(h: String?) {
+    private fun isWake(text: String): Boolean {
+        val tokens = text.trim().split(" ").filter { it.isNotBlank() }
+        if (tokens.count { it == "jarvis" } != 1) return false
+        if (tokens.size > 2) return false
+        return tokens.all { it == "jarvis" || it == "[unk]" }
+    }
+
+    private fun checkWake(h: String?, partial: Boolean) {
         if (busy) return
-        val t = field(h, "partial") + " " + field(h, "text")
-        if (!t.contains("jarvis")) return
+        val t = if (partial) field(h, "partial") else field(h, "text")
+        if (!isWake(t)) return
         busy = true
+        duck()
         stopWake()
-        say("Buyurun", "wake")
+        say("Buyurun efendim", "wake")
     }
 
     private fun startCommand() {
@@ -198,7 +228,7 @@ class JarvisService : Service() {
         try {
             val rec = Recognizer(trModel!!, 16000.0f)
             cmdSpeech = SpeechService(rec, 16000.0f)
-            cmdSpeech?.startListening(cmdListener, 9000)
+            cmdSpeech?.startListening(cmdListener, 20000)
             showNotification("Dinliyorum, komutu söyle...")
         } catch (e: Throwable) {
             showNotification("Hata: ${e.message}")
@@ -225,7 +255,11 @@ class JarvisService : Service() {
         val low = text.lowercase(trLocale)
         val f = followUp
         followUp = null
-        val reply = if (f != null) f(low) else execute(low)
+        val reply = try {
+            if (f != null) f(low) else runAll(low)
+        } catch (e: Throwable) {
+            "Bir hata oldu"
+        }
         say(reply, "reply")
     }
 
@@ -233,7 +267,62 @@ class JarvisService : Service() {
         followUp = null
         stopCmd()
         stopWake()
+        unduck()
         startWake()
+    }
+
+    private fun audio(): AudioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+
+    private fun duck() {
+        val am = audio()
+        if (savedVolume < 0) {
+            val cur = am.getStreamVolume(AudioManager.STREAM_MUSIC)
+            val low = maxOf(2, am.getStreamMaxVolume(AudioManager.STREAM_MUSIC) / 3)
+            if (cur > low) {
+                savedVolume = cur
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, low, 0)
+            }
+        }
+    }
+
+    private fun unduck() {
+        if (savedVolume >= 0) {
+            audio().setStreamVolume(AudioManager.STREAM_MUSIC, savedVolume, 0)
+            savedVolume = -1
+        }
+    }
+
+    private fun setLevel(level: Int) {
+        if (savedVolume >= 0) {
+            savedVolume = level
+        } else {
+            audio().setStreamVolume(AudioManager.STREAM_MUSIC, level, 0)
+        }
+    }
+
+    private fun percentReply(p: Int): String {
+        val max = audio().getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        setLevel(((max * p + 50) / 100).coerceIn(0, max))
+        return "Ses yüzde $p"
+    }
+
+    private fun volumeFromSpeech(nt: String, words: List<String>): String? {
+        if (nt.contains("full") || nt.contains("maksimum") || nt.contains("sonuna") || nt.contains("en yuksek")) {
+            return percentReply(100)
+        }
+        if (nt.contains("yarim") || nt.contains("yari")) return percentReply(50)
+        val n = numbersIn(words)
+        if (n.isNotEmpty()) return percentReply(n[0].coerceIn(0, 100))
+        return null
+    }
+
+    private fun volume(up: Boolean): String {
+        val am = audio()
+        val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        val base = if (savedVolume >= 0) savedVolume else am.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val step = maxOf(1, max / 5)
+        setLevel((base + if (up) step else -step).coerceIn(0, max))
+        return if (up) "Ses artırıldı" else "Ses azaltıldı"
     }
 
     private fun norm(s: String): String {
@@ -243,28 +332,56 @@ class JarvisService : Service() {
             .replace('â', 'a').replace('î', 'i').replace('û', 'u')
     }
 
+    private fun yes(a: String): Boolean {
+        val x = norm(a)
+        return x.contains("evet") || x.contains("tamam") || x.contains("olur") ||
+            x.contains("aynen") || x.contains("dogru")
+    }
+
+    private fun splitCommands(t: String): List<String> {
+        if (t.contains("mesaj") || t.contains("sms")) return listOf(t)
+        return t.split(Regex("\\s+(ve|sonra|ardindan|ayrica)\\s+"))
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+    }
+
+    private fun runAll(low: String): String {
+        val parts = splitCommands(norm(low))
+        if (parts.size <= 1) return execute(low)
+        val replies = mutableListOf<String>()
+        for (p in parts) {
+            replies.add(execute(p))
+            if (followUp != null) break
+        }
+        return replies.joinToString(". ")
+    }
+
     private fun execute(low: String): String {
         val nt = norm(low)
         val words = nt.split(" ").filter { it.isNotBlank() }
         val raw = low.split(" ").filter { it.isNotBlank() }
-        val openWords = setOf("ac", "baslat", "calistir", "git")
+        val openWords = setOf("ac", "baslat", "calistir")
         val callWords = setOf("ara", "arar", "arayin", "arasana")
         val isOpen = words.any { it in openWords }
+        val hasVol = words.any { it == "ses" || it == "sesi" }
+        val isMusic = nt.contains("muzi") || nt.contains("sarki") || words.any { it == "cal" || it == "oynat" }
         return when {
             nt.contains("alarm") -> setAlarm(nt, words)
             nt.contains("sayac") || nt.contains("zamanlayici") || nt.contains("geri sayim") -> setTimer(nt, words)
             words.any { it in callWords } -> callName(words)
             words.any { it == "mesaj" || it == "sms" } -> prepareSms(words, raw)
-            nt.contains("muzi") || nt.contains("sarki") -> musicControl(nt, words)
+            nt.contains("hoparlor") -> speaker(!nt.contains("kapat"))
+            nt.contains("rota") || nt.contains("yol tarifi") || nt.contains("navigasyon") ||
+                words.any { it == "gotur" || it == "goturr" } -> routeCmd(words)
+            isMusic -> musicRouter(nt, words, raw)
             nt.contains("fener") -> setTorch(!(nt.contains("kapat") || nt.contains("sondur")))
             nt.contains("sessiz") || nt.contains("titresim") ->
                 ringer(AudioManager.RINGER_MODE_VIBRATE, "Telefon titreşime alındı")
             nt.contains("zil") && (isOpen || nt.contains("normal")) ->
                 ringer(AudioManager.RINGER_MODE_NORMAL, "Zil sesi açıldı")
-            words.any { it == "ses" || it == "sesi" } &&
-                (nt.contains("artir") || nt.contains("yuksel") || nt.contains("yukselt") || isOpen) -> volume(true)
-            words.any { it == "ses" || it == "sesi" } &&
-                (nt.contains("azalt") || nt.contains("kis") || nt.contains("dusur")) -> volume(false)
+            hasVol && volumeFromSpeech(nt, words) != null -> volumeFromSpeech(nt, words) ?: "Ses ayarlandı"
+            hasVol && (nt.contains("artir") || nt.contains("yuksel") || isOpen) -> volume(true)
+            hasVol && (nt.contains("azalt") || nt.contains("kis") || nt.contains("dusur")) -> volume(false)
             nt.contains("saat") && !isOpen -> {
                 val c = Calendar.getInstance()
                 "Saat " + String.format("%02d:%02d", c.get(Calendar.HOUR_OF_DAY), c.get(Calendar.MINUTE))
@@ -276,17 +393,33 @@ class JarvisService : Service() {
                 "Pil yüzde " + bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
             }
             isOpen -> {
-                val rest = words.filter { it !in openWords }
+                val fillers = setOf("uygulama", "uygulamayi", "uygulamasini", "lutfen", "bana", "bir", "su", "sunu", "programi")
+                val rest = words.filter { it !in openWords && it !in fillers }
                 if (rest.isEmpty()) {
-                    followUp = { a -> execute("$a aç") }
+                    followUp = { a -> execute(norm(a) + " ac") }
                     "Neyi açayım?"
                 } else {
-                    openAppReply(nt)
+                    openApp(rest)
                 }
             }
             nt.contains("merhaba") || nt.contains("selam") -> "Merhaba, size nasıl yardımcı olabilirim"
-            else -> "Anlayamadım. Şunu duydum: $low"
+            else -> suggest(nt, words)
         }
+    }
+
+    private fun suggest(nt: String, words: List<String>): String {
+        for (w in words) {
+            if (w.length < 3) continue
+            for (k in keywords) {
+                val d = lev(w, k)
+                if (d in 1..2 && d <= k.length / 2) {
+                    val fixed = nt.replace(w, k)
+                    followUp = { a -> if (yes(a)) execute(fixed) else "Peki" }
+                    return "$fixed mi demek istediniz"
+                }
+            }
+        }
+        return "Tam anlayamadım. Şunu duydum: $nt"
     }
 
     private fun launch(i: Intent) {
@@ -438,6 +571,19 @@ class JarvisService : Service() {
         }
     }
 
+    private fun speaker(on: Boolean): String {
+        val am = audio()
+        val apply = Runnable {
+            try {
+                am.isSpeakerphoneOn = on
+            } catch (e: Throwable) {
+            }
+        }
+        handler.postDelayed(apply, 3000)
+        handler.postDelayed(apply, 7000)
+        return if (on) "Hoparlör açılıyor" else "Hoparlör kapatılıyor"
+    }
+
     private fun prepareSms(words: List<String>, raw: List<String>): String {
         val idx = words.indexOfFirst { it == "mesaj" || it == "sms" }
         if (idx <= 0) return "Kime mesaj göndereceğimi anlayamadım"
@@ -452,13 +598,14 @@ class JarvisService : Service() {
             ?: return "Rehberde " + nameWords.joinToString(" ") + " adında kimse bulamadım"
         followUp = { a ->
             val x = norm(a)
-            if (x.contains("evet") || x.contains("gonder") || x.contains("tamam") || x.contains("olur")) {
-                sendSms(c.second, body)
-            } else {
-                "Vazgeçtim"
+            when {
+                x.contains("whatsapp") || x.contains("votsap") || x.contains("vatsap") -> sendWhatsApp(c.second, body)
+                x.contains("mesaj") || x.contains("sms") -> sendSms(c.second, body)
+                else -> "Vazgeçtim"
             }
         }
-        return c.first + " kişisine şu mesajı göndereyim mi: " + body
+        return c.first + " kişisine şu mesajı göndereyim mi: " + body +
+            ". WhatsApp'tan mı, normal mesajdan mı? Vazgeçmek için iptal de"
     }
 
     private fun sendSms(number: String, body: String): String {
@@ -478,17 +625,85 @@ class JarvisService : Service() {
         }
     }
 
-    private fun mediaKey(code: Int) {
-        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
-        am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
+    private fun sendWhatsApp(number: String, body: String): String {
+        val d = number.filter { it.isDigit() }
+        val full = if (number.startsWith("+")) d else if (d.startsWith("0")) "90" + d.drop(1) else d
+        val uri = Uri.parse("https://wa.me/" + full + "?text=" + Uri.encode(body))
+        return try {
+            val i = Intent(Intent.ACTION_VIEW, uri)
+            i.setPackage("com.whatsapp")
+            launch(i)
+            "WhatsApp açıldı, mesaj yazıldı. Göndermek için gönder tuşuna basmanız gerekiyor"
+        } catch (e: Throwable) {
+            try {
+                launch(Intent(Intent.ACTION_VIEW, uri))
+                "WhatsApp açıldı, mesaj yazıldı. Göndermek için gönder tuşuna basmanız gerekiyor"
+            } catch (e2: Throwable) {
+                "WhatsApp'ı açamadım"
+            }
+        }
     }
 
-    private fun musicControl(nt: String, words: List<String>): String {
+    private fun routeCmd(words: List<String>): String {
+        val stop = setOf(
+            "rota", "olustur", "cizer", "cizin", "yol", "tarifi", "git", "gotur", "goturr",
+            "navigasyon", "icin", "bana", "bir", "cikar", "ac", "baslat", "lutfen", "bul", "hemen"
+        )
+        val dest = words.filter { it !in stop }.joinToString(" ")
+        if (dest.isBlank()) {
+            followUp = { a -> routeTo(norm(a)) }
+            return "Nereye gitmek istiyorsun?"
+        }
+        return routeTo(dest)
+    }
+
+    private fun routeTo(dest: String): String {
+        return try {
+            val i = Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=" + Uri.encode(dest)))
+            i.setPackage("com.google.android.apps.maps")
+            launch(i)
+            "$dest için rota Haritalar'da açıldı. Trafik ve alternatif yollar haritada görünür"
+        } catch (e: Throwable) {
+            try {
+                launch(Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=" + Uri.encode(dest))))
+                "$dest haritada açıldı"
+            } catch (e2: Throwable) {
+                "Harita uygulamasını açamadım"
+            }
+        }
+    }
+
+    private fun mediaKey(code: Int) {
+        val am = audio()
+        val t = SystemClock.uptimeMillis()
+        am.dispatchMediaKeyEvent(KeyEvent(t, t, KeyEvent.ACTION_DOWN, code, 0))
+        am.dispatchMediaKeyEvent(KeyEvent(t, t + 40, KeyEvent.ACTION_UP, code, 0))
+    }
+
+    private fun stopMusic() {
+        mediaKey(KeyEvent.KEYCODE_MEDIA_PAUSE)
+        try {
+            val am = audio()
+            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setOnAudioFocusChangeListener { _ -> }
+                .build()
+            am.requestAudioFocus(req)
+            handler.postDelayed({ am.abandonAudioFocusRequest(req) }, 2000)
+        } catch (e: Throwable) {
+        }
+    }
+
+    private fun musicRouter(nt: String, words: List<String>, raw: List<String>): String {
         if (nt.contains("durdur") || nt.contains("duraklat") || nt.contains("kapat") ||
             nt.contains("sustur") || words.contains("dur")
         ) {
-            mediaKey(KeyEvent.KEYCODE_MEDIA_PAUSE)
+            stopMusic()
             return "Müzik durduruldu"
         }
         if (nt.contains("sonraki") || nt.contains("ileri") || nt.contains("gec")) {
@@ -499,54 +714,93 @@ class JarvisService : Service() {
             mediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
             return "Önceki şarkı"
         }
-        return try {
-            val i = Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_MUSIC)
-            launch(i)
-            handler.postDelayed({ mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY) }, 2500)
-            "Müzik açılıyor"
-        } catch (e: Throwable) {
-            mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY)
-            "Müzik başlatıldı"
+        val stop = setOf(
+            "muzik", "muzigi", "muzikleri", "sarki", "sarkiyi", "sarkilari", "ac", "cal",
+            "oynat", "baslat", "bir", "bana", "calar", "misin", "lutfen", "dinlemek", "istiyorum"
+        )
+        val query = raw.filter { norm(it) !in stop }.joinToString(" ")
+        if (query.isBlank()) {
+            followUp = { a -> musicPlay(a) }
+            return "Hangi müziği açayım?"
         }
+        return musicPlay(query)
+    }
+
+    private fun musicPlay(query: String): String {
+        val q = query.trim()
+        val nq = norm(q)
+        val generic = nq.contains("farketmez") || nq.contains("herhangi") || nq.contains("rastgele") ||
+            nq.contains("listem") || nq.contains("favori")
+        try {
+            if (generic) {
+                launch(Intent.makeMainSelectorActivity(Intent.ACTION_MAIN, Intent.CATEGORY_APP_MUSIC))
+                handler.postDelayed({ mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY) }, 2500)
+            } else {
+                val i = Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH)
+                i.putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/*")
+                i.putExtra(SearchManager.QUERY, q)
+                launch(i)
+            }
+        } catch (e: Throwable) {
+            return "Müzik uygulaması bulamadım"
+        }
+        followUp = { v ->
+            val x = norm(v)
+            val r = volumeFromSpeech(x, x.split(" ").filter { it.isNotBlank() })
+            r ?: "Ses seviyesini anlayamadım"
+        }
+        return "Müzik açılıyor. Ses seviyesi yüzde kaç olsun?"
     }
 
     private fun ringer(mode: Int, ok: String): String {
         return try {
-            val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            am.ringerMode = mode
+            audio().ringerMode = mode
             ok
         } catch (e: Throwable) {
             "Zil modunu değiştiremedim"
         }
     }
 
-    private fun openAppReply(nt: String): String {
+    private fun openApp(rest: List<String>): String {
+        val q = rest.joinToString("") { appAliases[it] ?: it }
+        if (q.isBlank()) return "Hangi uygulamayı açacağımı anlayamadım"
         val pm = packageManager
         val main = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         val apps = pm.queryIntentActivities(main, 0)
-        var target: String? = null
-        for ((k, v) in aliases) {
-            if (nt.contains(k)) {
-                target = v
-                break
-            }
-        }
+        var bestPkg: String? = null
+        var bestLabel = ""
+        var bestScore = 9.0
+        var bestLen = 999
         for (a in apps) {
-            val l = norm(a.loadLabel(pm).toString())
-            val hit = if (target != null) l.contains(target) else (l.length >= 3 && nt.contains(l))
-            if (hit) {
-                val i = pm.getLaunchIntentForPackage(a.activityInfo.packageName)
-                if (i != null) {
-                    return try {
-                        launch(i)
-                        l + " açılıyor"
-                    } catch (e: Throwable) {
-                        "Açamadım"
-                    }
-                }
+            val label = norm(a.loadLabel(pm).toString()).replace(" ", "")
+            val pkg = a.activityInfo.packageName.lowercase()
+            if (label.isEmpty()) continue
+            val exact = label.contains(q) || (label.length >= 3 && q.contains(label)) || (q.length >= 4 && pkg.contains(q))
+            val score = if (exact) 0.0 else lev(label, q).toDouble() / maxOf(label.length, q.length)
+            if (score < bestScore || (score == bestScore && label.length < bestLen)) {
+                bestScore = score
+                bestPkg = pkg
+                bestLabel = a.loadLabel(pm).toString()
+                bestLen = label.length
             }
         }
-        return "Uygulamayı bulamadım"
+        val found = bestPkg ?: return "Uygulamayı bulamadım. Şunu duydum: $q"
+        if (bestScore == 0.0) return launchPackage(found, bestLabel)
+        if (bestScore <= 0.4) {
+            followUp = { a -> if (yes(a)) launchPackage(found, bestLabel) else "Peki" }
+            return "$bestLabel uygulamasını mı açayım"
+        }
+        return "Uygulamayı bulamadım. Şunu duydum: $q"
+    }
+
+    private fun launchPackage(pkg: String, label: String): String {
+        val i = packageManager.getLaunchIntentForPackage(pkg) ?: return "Uygulamayı açamadım"
+        return try {
+            launch(i)
+            "$label açılıyor"
+        } catch (e: Throwable) {
+            "Açamadım"
+        }
     }
 
     private fun setTorch(on: Boolean): String {
@@ -560,16 +814,6 @@ class JarvisService : Service() {
         } catch (e: Throwable) {
             "Feneri çalıştıramadım"
         }
-    }
-
-    private fun volume(up: Boolean): String {
-        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-        am.adjustStreamVolume(
-            AudioManager.STREAM_MUSIC,
-            if (up) AudioManager.ADJUST_RAISE else AudioManager.ADJUST_LOWER,
-            0
-        )
-        return if (up) "Ses artırıldı" else "Ses azaltıldı"
     }
 
     private fun field(json: String?, key: String): String {
@@ -625,9 +869,14 @@ class JarvisService : Service() {
     override fun onDestroy() {
         stopWake()
         stopCmd()
+        unduck()
         try {
             enModel?.close()
             trModel?.close()
+        } catch (e: Throwable) {
+        }
+        try {
+            wakeLock?.release()
         } catch (e: Throwable) {
         }
         tts?.shutdown()
