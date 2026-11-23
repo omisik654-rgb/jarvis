@@ -7,17 +7,22 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.SearchManager
 import android.app.Service
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
+import android.graphics.Color
+import android.graphics.PixelFormat
 import android.graphics.drawable.Icon
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.browse.MediaBrowser
+import android.media.session.MediaController
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.net.Uri
@@ -32,12 +37,16 @@ import android.os.SystemClock
 import android.provider.AlarmClock
 import android.provider.ContactsContract
 import android.provider.MediaStore
+import android.provider.Settings
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.telephony.SmsManager
+import android.view.Gravity
 import android.view.KeyEvent
+import android.view.View
+import android.view.WindowManager
 import org.json.JSONArray
 import org.json.JSONObject
 import org.vosk.Model
@@ -73,18 +82,21 @@ class JarvisService : Service() {
     private var handled = false
     private var lastPartial = ""
     private var buffer = ""
-    private var curTimeout = 20000
+    private var curTimeout = 8000
     private var googleFailUntil = 0L
     private var lastAlts: List<String> = emptyList()
     private var followUp: ((String) -> String)? = null
     private var silenceAction: (() -> String)? = null
-    private var savedVolume = -1
     private var wakeLock: PowerManager.WakeLock? = null
     private var friendMode = false
     private var enrolling = false
     private val enrollVecs = mutableListOf<DoubleArray>()
     private var lastSpk: DoubleArray? = null
     private var lastFrames = 0
+    private var pausedByWake = false
+    private var overlay: View? = null
+    private var contactCache: List<Contact> = emptyList()
+    private var contactCacheAt = 0L
 
     private val aiMark = "@@AI@@"
 
@@ -106,6 +118,19 @@ class JarvisService : Service() {
             "ve 112'yi ya da güvendiği birini aramasını öner. Sağlık konusunda teşhis koyma."
 
     private val finalizeRunnable = Runnable { gotText(buffer) }
+    private val hardRunnable = Runnable { onHard() }
+    private val forceRunnable = Runnable {
+        if (!handled) {
+            if (lastPartial.isNotBlank()) gotText(lastPartial) else blankTimeout()
+        }
+    }
+    private val stopRunnable = Runnable {
+        try {
+            recognizer?.stopListening()
+        } catch (e: Throwable) {
+        }
+        handler.postDelayed(forceRunnable, 900)
+    }
 
     private val refreshRunnable = object : Runnable {
         override fun run() {
@@ -127,6 +152,11 @@ class JarvisService : Service() {
         "altmis" to 60, "yetmis" to 70, "seksen" to 80, "doksan" to 90, "yuz" to 100
     )
     private val sfx = listOf("", "da", "de", "ta", "te", "a", "e", "ya", "ye")
+
+    private val suffixes = listOf(
+        "nin", "nun", "den", "dan", "ten", "tan", "yi", "yu", "ye", "ya",
+        "de", "da", "te", "ta", "in", "un", "i", "u", "e", "a"
+    )
 
     private val appAliases = mapOf(
         "votsap" to "whatsapp", "vatsap" to "whatsapp", "vatsapp" to "whatsapp",
@@ -150,16 +180,19 @@ class JarvisService : Service() {
     )
 
     private val stopNames = setOf(
-        "ara", "arar", "arayin", "arasana", "beni", "bana", "lutfen", "telefon", "numara", "numarasini",
-        "numarayi", "kisisini", "kisi", "kisiyi", "mesaj", "at", "gonder", "yaz", "yolla", "diye",
-        "icin", "bir", "sunu", "ve", "sonra", "hoparlore", "hoparlor", "al", "ac", "ona", "onu", "su",
-        "gibi", "de", "da", "hemen", "tekrar"
+        "ara", "arar", "arayin", "arasana", "aramak", "beni", "bana", "lutfen", "telefon", "numara",
+        "numarasini", "numarayi", "kisisini", "kisi", "kisiyi", "mesaj", "at", "gonder", "yaz", "yolla",
+        "diye", "icin", "bir", "sunu", "ve", "sonra", "hoparlore", "hoparlor", "al", "ac", "ona", "onu",
+        "su", "gibi", "de", "da", "hemen", "tekrar"
     )
 
     private val musicPkgs = listOf(
         "com.spotify.music" to "Spotify",
         "com.google.android.apps.youtube.music" to "YouTube Music",
-        "com.miui.player" to "Mi Müzik"
+        "com.miui.player" to "Mi Müzik",
+        "deezer.android.app" to "Deezer",
+        "com.apple.android.music" to "Apple Music",
+        "com.turkcell.gncplay" to "Fizy"
     )
 
     private fun prefs(): SharedPreferences = getSharedPreferences("jarvis", Context.MODE_PRIVATE)
@@ -168,6 +201,8 @@ class JarvisService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         showNotification("Hazırlanıyor...")
+        JarvisState.running = true
+        ensureOverlay()
         val wantFriend = intent?.getBooleanExtra("friend", false) == true
         if (intent?.action == "LISTEN") handler.post { triggerWake() }
         if (wakeLock == null) {
@@ -199,6 +234,10 @@ class JarvisService : Service() {
                     } catch (e: Throwable) {
                         spkModel = null
                     }
+                    try {
+                        if (hasContactsPermission()) loadContacts()
+                    } catch (e: Throwable) {
+                    }
                     handler.post { if (friendMode) enterFriend() else startWake() }
                 } catch (e: Throwable) {
                     showNotification("Hata: ${e.message}")
@@ -210,13 +249,33 @@ class JarvisService : Service() {
         return START_STICKY
     }
 
+    private fun ensureOverlay() {
+        if (overlay != null) return
+        try {
+            if (!Settings.canDrawOverlays(this)) return
+            val wm = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            val v = View(this)
+            v.setBackgroundColor(Color.argb(2, 0, 0, 0))
+            val lp = WindowManager.LayoutParams(
+                1, 1,
+                WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE,
+                PixelFormat.TRANSLUCENT
+            )
+            lp.gravity = Gravity.TOP or Gravity.START
+            wm.addView(v, lp)
+            overlay = v
+        } catch (e: Throwable) {
+        }
+    }
+
     private fun initTts() {
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
                 tts?.language = trLocale
                 applyVoice()
                 tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(id: String?) {}
+                    override fun onStart(id: String?) { JarvisState.speaking = true }
                     override fun onDone(id: String?) { handler.post { spoken(id) } }
                     override fun onError(id: String?) { handler.post { spoken(id) } }
                 })
@@ -227,8 +286,8 @@ class JarvisService : Service() {
 
     private fun applyVoice() {
         val t = tts ?: return
-        t.setPitch(0.82f)
-        t.setSpeechRate(0.94f)
+        t.setPitch(prefs().getFloat("pitch", 0.7f))
+        t.setSpeechRate(0.92f)
         try {
             val list = t.voices.filter { it.locale.language == "tr" }.sortedBy { it.name }
             if (list.isNotEmpty()) {
@@ -260,16 +319,34 @@ class JarvisService : Service() {
         return result
     }
 
+    private fun adjustPitch(thicker: Boolean): String {
+        var p = prefs().getFloat("pitch", 0.7f)
+        p = (p + if (thicker) -0.1f else 0.1f).coerceIn(0.4f, 1.3f)
+        prefs().edit().putFloat("pitch", p).apply()
+        tts?.setPitch(p)
+        return if (thicker) "Sesim kalınlaştı" else "Sesim inceldi"
+    }
+
     private fun say(text: String, id: String) {
+        JarvisState.line = text
         if (ttsReady) tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, id) else spoken(id)
     }
 
     private fun spoken(id: String?) {
-        if (id == "wake" || id == "friend" || followUp != null || silenceAction != null || friendMode) {
-            startCommand(if (id == "wake" || id == "friend" || friendMode) 20000 else 9000)
-        } else {
-            resumeWake()
+        JarvisState.speaking = false
+        if (id == "wake") {
+            handler.postDelayed({ startCommand(8000) }, 250)
+            return
         }
+        if (id == "friend" || friendMode) {
+            handler.postDelayed({ startCommand(12000) }, 250)
+            return
+        }
+        if (followUp != null || silenceAction != null) {
+            handler.postDelayed({ startCommand(7000) }, 250)
+            return
+        }
+        resumeWake()
     }
 
     private fun enterFriend() {
@@ -315,7 +392,7 @@ class JarvisService : Service() {
             if (t.isNotBlank()) {
                 buffer = (buffer + " " + t).trim()
                 handler.removeCallbacks(finalizeRunnable)
-                handler.postDelayed(finalizeRunnable, 2500)
+                handler.postDelayed(finalizeRunnable, 1000)
                 readSpeaker(h)
             }
         }
@@ -337,13 +414,22 @@ class JarvisService : Service() {
         override fun onEvent(t: Int, p: Bundle?) {}
         override fun onPartialResults(b: Bundle?) {
             val l = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            if (!l.isNullOrEmpty()) lastPartial = l[0]
+            if (!l.isNullOrEmpty() && l[0].isNotBlank()) {
+                lastPartial = l[0]
+                handler.removeCallbacks(hardRunnable)
+                handler.postDelayed(hardRunnable, 25000)
+                handler.removeCallbacks(stopRunnable)
+                handler.removeCallbacks(forceRunnable)
+                handler.postDelayed(stopRunnable, 1700)
+            }
         }
         override fun onResults(b: Bundle?) {
             if (handled) return
+            handler.removeCallbacks(stopRunnable)
+            handler.removeCallbacks(forceRunnable)
             val l = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-            if (l.isNullOrEmpty()) {
-                blankTimeout()
+            if (l.isNullOrEmpty() || l[0].isBlank()) {
+                if (lastPartial.isNotBlank()) gotText(lastPartial) else blankTimeout()
                 return
             }
             lastAlts = l
@@ -351,6 +437,8 @@ class JarvisService : Service() {
         }
         override fun onError(code: Int) {
             if (handled) return
+            handler.removeCallbacks(stopRunnable)
+            handler.removeCallbacks(forceRunnable)
             if (code == SpeechRecognizer.ERROR_NO_MATCH || code == SpeechRecognizer.ERROR_SPEECH_TIMEOUT) {
                 if (lastPartial.isNotBlank()) gotText(lastPartial) else blankTimeout()
             } else {
@@ -359,6 +447,12 @@ class JarvisService : Service() {
                 startVosk(curTimeout)
             }
         }
+    }
+
+    private fun onHard() {
+        if (handled) return
+        val txt = if (buffer.isNotBlank()) buffer else lastPartial
+        if (txt.isNotBlank()) gotText(txt) else blankTimeout()
     }
 
     private fun readSpeaker(h: String?) {
@@ -382,6 +476,7 @@ class JarvisService : Service() {
             wakeSpeech = SpeechService(rec, 16000.0f)
             wakeSpeech?.startListening(wakeListener)
             busy = false
+            JarvisState.listening = false
             showNotification("Jarvis dinliyor")
             handler.removeCallbacks(refreshRunnable)
             handler.postDelayed(refreshRunnable, 480000)
@@ -416,7 +511,10 @@ class JarvisService : Service() {
     private fun triggerWake() {
         if (busy || enModel == null || trModel == null) return
         busy = true
-        duck()
+        if (audio().isMusicActive) {
+            pausedByWake = true
+            stopMusic()
+        }
         stopWake()
         say("Buyurun efendim", "wake")
     }
@@ -430,6 +528,13 @@ class JarvisService : Service() {
             SpeechRecognizer.isRecognitionAvailable(this)
     }
 
+    private fun clearTimers() {
+        handler.removeCallbacks(finalizeRunnable)
+        handler.removeCallbacks(hardRunnable)
+        handler.removeCallbacks(stopRunnable)
+        handler.removeCallbacks(forceRunnable)
+    }
+
     private fun startCommand(timeoutMs: Int) {
         handled = false
         lastPartial = ""
@@ -438,9 +543,30 @@ class JarvisService : Service() {
         lastFrames = 0
         lastAlts = emptyList()
         curTimeout = timeoutMs
-        handler.removeCallbacks(finalizeRunnable)
-        if (useGoogle() && startGoogle()) return
+        clearTimers()
+        JarvisState.listening = true
+        if (useGoogle() && startGoogle()) {
+            handler.postDelayed(hardRunnable, timeoutMs + 500L)
+            return
+        }
         startVosk(timeoutMs)
+    }
+
+    private fun biasList(): ArrayList<String> {
+        val out = LinkedHashSet<String>()
+        out.add("Jarvis")
+        try {
+            if (hasContactsPermission()) {
+                for (c in loadContacts()) {
+                    out.add(c.name)
+                    val f = c.name.trim().split(" ").firstOrNull()
+                    if (!f.isNullOrBlank() && f.length >= 2) out.add(f)
+                    if (out.size >= 200) break
+                }
+            }
+        } catch (e: Throwable) {
+        }
+        return ArrayList(out)
     }
 
     private fun startGoogle(): Boolean {
@@ -454,9 +580,11 @@ class JarvisService : Service() {
             i.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
             i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
             i.putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, !online())
-            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 3000L)
-            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 3000L)
-            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 6000L)
+            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1500L)
+            i.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1200L)
+            if (Build.VERSION.SDK_INT >= 33) {
+                i.putStringArrayListExtra(RecognizerIntent.EXTRA_BIASING_STRINGS, biasList())
+            }
             r.startListening(i)
             showNotification(if (friendMode) "Seni dinliyorum..." else "Dinliyorum, komutu söyle...")
             true
@@ -481,7 +609,8 @@ class JarvisService : Service() {
     }
 
     private fun stopCmd() {
-        handler.removeCallbacks(finalizeRunnable)
+        clearTimers()
+        JarvisState.listening = false
         try {
             cmdSpeech?.stop()
             cmdSpeech?.shutdown()
@@ -559,7 +688,7 @@ class JarvisService : Service() {
     private fun butler(r: String): String {
         val ends = listOf(
             "aranıyor", "açılıyor", "kuruldu", "açıldı", "kapatıldı", "durduruldu",
-            "artırıldı", "azaltıldı", "gönderildi", "gönderiliyor"
+            "artırıldı", "azaltıldı", "gönderildi", "gönderiliyor", "devam ediyor"
         )
         return if (ends.any { r.endsWith(it) }) "Elbette efendim. $r" else r
     }
@@ -611,9 +740,10 @@ class JarvisService : Service() {
         silenceAction = null
         enrolling = false
         enrollVecs.clear()
+        JarvisState.speaking = false
+        JarvisState.thinking = false
         stopCmd()
         stopWake()
-        unduck()
         startWake()
     }
 
@@ -760,6 +890,7 @@ class JarvisService : Service() {
         val search = !friend && needsSearch(nt)
         val max = if (!friend && isLong(nt)) 1500 else 500
         val tools = if (friend) null else toolsJson
+        JarvisState.thinking = true
         showNotification("Düşünüyorum...")
         Thread {
             val ans = try {
@@ -788,6 +919,7 @@ class JarvisService : Service() {
     }
 
     private fun deliver(ans: String) {
+        JarvisState.thinking = false
         prefs().edit().putString("last_answer", ans).apply()
         var s = ans.replace(Regex("[*#_`>]"), "").replace(Regex("\\s+"), " ").trim()
         if (s.isBlank()) s = "Cevap alamadım"
@@ -802,36 +934,10 @@ class JarvisService : Service() {
 
     private fun audio(): AudioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-    private fun duck() {
-        val am = audio()
-        if (savedVolume < 0) {
-            val cur = am.getStreamVolume(AudioManager.STREAM_MUSIC)
-            val low = maxOf(2, am.getStreamMaxVolume(AudioManager.STREAM_MUSIC) / 3)
-            if (cur > low) {
-                savedVolume = cur
-                am.setStreamVolume(AudioManager.STREAM_MUSIC, low, 0)
-            }
-        }
-    }
-
-    private fun unduck() {
-        if (savedVolume >= 0) {
-            audio().setStreamVolume(AudioManager.STREAM_MUSIC, savedVolume, 0)
-            savedVolume = -1
-        }
-    }
-
-    private fun setLevel(level: Int) {
-        if (savedVolume >= 0) {
-            savedVolume = level
-        } else {
-            audio().setStreamVolume(AudioManager.STREAM_MUSIC, level, 0)
-        }
-    }
-
     private fun percentReply(p: Int): String {
-        val max = audio().getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-        setLevel(((max * p + 50) / 100).coerceIn(0, max))
+        val am = audio()
+        val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
+        am.setStreamVolume(AudioManager.STREAM_MUSIC, ((max * p + 50) / 100).coerceIn(0, max), 0)
         return "Ses yüzde $p"
     }
 
@@ -848,9 +954,9 @@ class JarvisService : Service() {
     private fun volume(up: Boolean): String {
         val am = audio()
         val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-        val base = if (savedVolume >= 0) savedVolume else am.getStreamVolume(AudioManager.STREAM_MUSIC)
+        val base = am.getStreamVolume(AudioManager.STREAM_MUSIC)
         val step = maxOf(1, max / 5)
-        setLevel((base + if (up) step else -step).coerceIn(0, max))
+        am.setStreamVolume(AudioManager.STREAM_MUSIC, (base + if (up) step else -step).coerceIn(0, max), 0)
         return if (up) "Ses artırıldı" else "Ses azaltıldı"
     }
 
@@ -860,6 +966,9 @@ class JarvisService : Service() {
             .replace('ş', 's').replace('ç', 'c').replace('ğ', 'g')
             .replace('â', 'a').replace('î', 'i').replace('û', 'u')
     }
+
+    private fun ntok(s: String): List<String> =
+        norm(s).replace(Regex("[^a-z0-9 ]"), " ").split(" ").filter { it.length >= 2 }
 
     private fun yes(a: String): Boolean {
         val x = norm(a)
@@ -921,6 +1030,9 @@ class JarvisService : Service() {
         if (nt.contains("ses kilid") || nt.contains("ses tanima")) return lockToggle(!nt.contains("kapat"))
         if (nt.contains("hassasiyet")) return sensitivity(nt)
         if (nt.contains("ses") && nt.contains("degistir") && !nt.contains("seviye")) return nextVoice()
+        if (nt.contains("ses") && (nt.contains("kalin") || nt.contains("ince"))) {
+            return adjustPitch(nt.contains("kalin"))
+        }
         if (hasAi() && !localFirst(nt, words)) {
             askAi(low, false)
             return aiMark
@@ -1147,6 +1259,8 @@ class JarvisService : Service() {
     }
 
     private fun loadContacts(): List<Contact> {
+        val now = SystemClock.elapsedRealtime()
+        if (contactCache.isNotEmpty() && now - contactCacheAt < 300000) return contactCache
         val out = LinkedHashMap<String, Contact>()
         val cursor = contentResolver.query(
             ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
@@ -1164,7 +1278,9 @@ class JarvisService : Service() {
                 if (!out.containsKey(k)) out[k] = Contact(n, num)
             }
         }
-        return out.values.toList()
+        contactCache = out.values.toList()
+        contactCacheAt = now
+        return contactCache
     }
 
     private fun phon(s: String): String {
@@ -1194,32 +1310,49 @@ class JarvisService : Service() {
         if (q.length >= 3 && t.startsWith(q)) return 1.2
         val pq = phon(q)
         val pt = phon(t)
-        if (pq == pt) return 2.0
-        if (pt.length >= 3 && pq.startsWith(pt)) return 2.2
+        if (pq == pt) return 1.1
+        if (pt.length >= 3 && pq.startsWith(pt)) return 1.4
         val d = lev(pq, pt)
-        if (pq.length >= 4 && pt.length >= 4 && d <= 1) return 3.0
-        if (pq.length >= 6 && pt.length >= 6 && d <= 2) return 3.5
+        if (pq.length >= 4 && pt.length >= 4 && d <= 1) return 2.5
+        if (pq.length >= 6 && pt.length >= 6 && d <= 2) return 3.2
         return 9.0
     }
 
+    private fun stems(w: String): List<String> {
+        val out = arrayListOf(w)
+        for (s in suffixes) {
+            if (w.endsWith(s) && w.length - s.length >= 3) {
+                out.add(w.dropLast(s.length))
+                if (out.size >= 3) break
+            }
+        }
+        return out
+    }
+
     private fun rank(queries: List<String>): List<Pair<Contact, Double>> {
-        val toks = ArrayList<Triple<String, Double, Boolean>>()
+        val toks = ArrayList<Triple<List<String>, Double, Boolean>>()
         for ((i, q) in queries.withIndex()) {
-            for (w in norm(q).split(" ")) {
-                if (w.length >= 2 && w !in stopNames) toks.add(Triple(w, i * 0.15, i == 0))
+            for (w in ntok(q)) {
+                if (w !in stopNames) toks.add(Triple(stems(w), i * 0.15, i == 0))
             }
         }
         val out = ArrayList<Pair<Contact, Double>>()
         for (c in loadContacts()) {
-            val parts = norm(c.name).split(" ").filter { it.length >= 2 }
+            val parts = ntok(c.name)
             var best = 9.0
-            val matched = HashSet<String>()
-            for ((w, pen, first) in toks) {
+            val matched = HashSet<Int>()
+            for ((ti, tk) in toks.withIndex()) {
+                val variants = tk.first
+                val pen = tk.second
+                val first = tk.third
                 for (p in parts) {
-                    val s = tokScore(w, p)
-                    if (s < 9.0) {
-                        if (s + pen < best) best = s + pen
-                        if (first && s < 3.5) matched.add(w)
+                    for ((vi, v) in variants.withIndex()) {
+                        val raw = tokScore(v, p)
+                        if (raw < 9.0) {
+                            val s = raw + (if (vi > 0) 0.05 else 0.0) + pen
+                            if (s < best) best = s
+                            if (first) matched.add(ti)
+                        }
                     }
                 }
             }
@@ -1239,7 +1372,7 @@ class JarvisService : Service() {
             followUp = { a -> pickContact(a, list, then) }
             return list.joinToString(", ") { it.name + " mı" } + "? Hangisini istiyorsun"
         }
-        if (top.second <= 1.3) return then(top.first)
+        if (top.second <= 1.5) return then(top.first)
         followUp = { a -> if (yes(a)) then(top.first) else "Peki, vazgeçtim" }
         return top.first.name + " mı demek istediniz"
     }
@@ -1252,12 +1385,14 @@ class JarvisService : Service() {
         var best: Contact? = null
         var bs = 9.0
         for (c in list) {
-            for (p in norm(c.name).split(" ")) {
-                for (w in x.split(" ")) {
-                    val s = tokScore(w, p)
-                    if (s < bs) {
-                        bs = s
-                        best = c
+            for (p in ntok(c.name)) {
+                for (w in ntok(x)) {
+                    for (v in stems(w)) {
+                        val s = tokScore(v, p)
+                        if (s < bs) {
+                            bs = s
+                            best = c
+                        }
                     }
                 }
             }
@@ -1430,6 +1565,7 @@ class JarvisService : Service() {
     private fun mediaControl(action: String): String {
         return when (action) {
             "pause" -> {
+                pausedByWake = false
                 stopMusic()
                 "Müzik durduruldu"
             }
@@ -1441,11 +1577,22 @@ class JarvisService : Service() {
                 mediaKey(KeyEvent.KEYCODE_MEDIA_PREVIOUS)
                 "Önceki şarkı"
             }
-            else -> {
-                mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY)
-                "Müzik başlatıldı"
-            }
+            else -> resumeMusic()
         }
+    }
+
+    private fun musicPackage(): String? {
+        val apps = installedMusic()
+        val pref = prefs().getString("music_app", null)
+        return apps.firstOrNull { it.first == pref }?.first ?: apps.firstOrNull()?.first
+    }
+
+    private fun resumeMusic(): String {
+        pausedByWake = false
+        mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY)
+        val pkg = musicPackage()
+        if (pkg != null) ensurePlaying(pkg, "")
+        return "Müzik devam ediyor"
     }
 
     private fun musicRouter(nt: String, words: List<String>, raw: List<String>): String {
@@ -1454,6 +1601,8 @@ class JarvisService : Service() {
                 nt.contains("spotify") -> "com.spotify.music"
                 nt.contains("youtube") || nt.contains("yutub") -> "com.google.android.apps.youtube.music"
                 nt.contains("miui") || nt.contains("mi ") -> "com.miui.player"
+                nt.contains("deezer") -> "deezer.android.app"
+                nt.contains("fizy") -> "com.turkcell.gncplay"
                 else -> ""
             }
             if (pick.isNotEmpty()) {
@@ -1466,6 +1615,7 @@ class JarvisService : Service() {
         ) {
             return mediaControl("pause")
         }
+        if (nt.contains("devam")) return resumeMusic()
         if (nt.contains("sonraki") || nt.contains("ileri") || nt.contains("gec")) return mediaControl("next")
         if (nt.contains("onceki") || nt.contains("geri")) return mediaControl("previous")
         val stop = setOf(
@@ -1480,13 +1630,13 @@ class JarvisService : Service() {
                 if (x.contains("farketmez") || x.contains("herhangi") || x.contains("rastgele") ||
                     x.contains("sen sec") || x.contains("bilmem")
                 ) {
-                    musicPlay("")
+                    if (pausedByWake) resumeMusic() else musicPlay("")
                 } else {
                     musicPlay(a)
                 }
             }
-            silenceAction = { musicPlay("") }
-            return "Hangi şarkıyı açayım? Bir şey söylemezsen sana uygun bir müzik açarım"
+            silenceAction = { if (pausedByWake) resumeMusic() else musicPlay("") }
+            return "Hangi şarkıyı açayım?"
         }
         return musicPlay(query)
     }
@@ -1504,9 +1654,8 @@ class JarvisService : Service() {
 
     private fun musicPlay(query: String): String {
         val q = query.trim()
-        val apps = installedMusic()
-        val pref = prefs().getString("music_app", null)
-        val pkg = apps.firstOrNull { it.first == pref }?.first ?: apps.firstOrNull()?.first
+        val pkg = musicPackage()
+        pausedByWake = false
         try {
             if (pkg != null) {
                 if (q.isBlank()) {
@@ -1520,7 +1669,7 @@ class JarvisService : Service() {
                     i.putExtra(SearchManager.QUERY, q)
                     launch(i)
                 }
-                ensurePlaying()
+                ensurePlaying(pkg, q)
             } else {
                 val url = "https://www.youtube.com/results?search_query=" + Uri.encode(if (q.isBlank()) "müzik" else q)
                 launch(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
@@ -1529,23 +1678,49 @@ class JarvisService : Service() {
         } catch (e: Throwable) {
             return "Müzik uygulaması bulamadım"
         }
-        followUp = { v ->
-            val x = norm(v)
-            volumeFromSpeech(x, x.split(" ").filter { it.isNotBlank() }) ?: "Ses seviyesini anlayamadım"
-        }
-        silenceAction = { "Tamam, ses aynı kalıyor" }
-        return "Müzik açılıyor. Ses seviyesi yüzde kaç olsun?"
+        return if (q.isBlank()) "Müzik açılıyor" else "$q açılıyor"
     }
 
-    private fun ensurePlaying() {
+    private fun tryBrowser(pkg: String, q: String) {
+        try {
+            val svcs = packageManager.queryIntentServices(Intent("android.media.browse.MediaBrowserService"), 0)
+            val s = svcs.firstOrNull { it.serviceInfo.packageName == pkg } ?: return
+            val comp = ComponentName(pkg, s.serviceInfo.name)
+            var br: MediaBrowser? = null
+            br = MediaBrowser(this, comp, object : MediaBrowser.ConnectionCallback() {
+                override fun onConnected() {
+                    try {
+                        val mc = MediaController(this@JarvisService, br!!.sessionToken)
+                        if (q.isBlank()) {
+                            mc.transportControls.play()
+                        } else {
+                            mc.transportControls.playFromSearch(q, Bundle())
+                        }
+                    } catch (e: Throwable) {
+                    }
+                    handler.postDelayed({
+                        try {
+                            br?.disconnect()
+                        } catch (e: Throwable) {
+                        }
+                    }, 4000)
+                }
+            }, null)
+            br.connect()
+        } catch (e: Throwable) {
+        }
+    }
+
+    private fun ensurePlaying(pkg: String, q: String) {
+        handler.postDelayed({ if (!audio().isMusicActive) tryBrowser(pkg, q) }, 3500)
         handler.postDelayed({
             if (!audio().isMusicActive) {
-                JarvisAccess.instance?.clickText("Oynat", "Play", "Çal", "Karışık", "Shuffle")
+                JarvisAccess.instance?.clickText("Oynat", "Play", "Çal", "Karışık çal", "Shuffle play")
             }
-        }, 6000)
+        }, 7000)
         handler.postDelayed({
             if (!audio().isMusicActive) mediaKey(KeyEvent.KEYCODE_MEDIA_PLAY)
-        }, 12000)
+        }, 11000)
     }
 
     private fun ringer(mode: Int, ok: String): String {
@@ -1645,6 +1820,7 @@ class JarvisService : Service() {
     }
 
     private fun showNotification(text: String) {
+        JarvisState.line = text
         val channelId = "jarvis"
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
@@ -1672,14 +1848,24 @@ class JarvisService : Service() {
     }
 
     override fun onDestroy() {
+        JarvisState.running = false
+        JarvisState.speaking = false
+        JarvisState.listening = false
+        JarvisState.thinking = false
         handler.removeCallbacks(refreshRunnable)
         stopWake()
         stopCmd()
-        unduck()
         try {
             enModel?.close()
             trModel?.close()
             spkModel?.close()
+        } catch (e: Throwable) {
+        }
+        try {
+            val v = overlay
+            if (v != null) {
+                (getSystemService(Context.WINDOW_SERVICE) as WindowManager).removeView(v)
+            }
         } catch (e: Throwable) {
         }
         try {
